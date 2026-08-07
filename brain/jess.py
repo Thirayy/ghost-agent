@@ -4,39 +4,86 @@ import requests
 import json
 import re
 import subprocess
+import time
+import google as genai
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../core')))
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+CORE_DIR = os.path.join(ROOT_DIR, 'core')
+if CORE_DIR not in sys.path:
+    sys.path.append(CORE_DIR)
+
+from brain import plugins
 from db_manager import get_connect
+from plugins import file_manager
+from plugins import apps_manager
+from plugins import file_reader
+from plugins import file_manager
+from plugins import git_manager
+from plugins import process_manager
+from brain.router import GhostRouter
+from core.identity_engine import MODEL_NAME
+from google.genai import Client
 
+class GroqEngine:
+    def __init__(self):
+        # Ambil API key gratis di console.groq.com
+        self.api_key = "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"
+        self.url = "https://api.groq.com/openai/v1/chat/completions"
+        
+        # Pake Llama 3.3 70B (otaknya pinter, ga bego, dan ngebut parah)
+        self.model = "llama-3.3-70b-versatile"
+        
+        self.messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Lu Jess, temen nongkrong Tijen yang pinter IT. "
+                    "GAYA: Santai, gaul (gw/lu/blay/coii/jirr), ceplas-ceplos, tapi fokus ngerjain tugas. "
+                    "BAHASA: WAJIB INDONESIA. JANGAN PERNAH PAKE BAHASA ASING. "
+                    "DILARANG: Formal, sopan, perkenalan diri, ngaku AI, bahasa baku. "
+                    "DILARANG PAKE EMOJI."
+                )
+            }
+        ]
 
-def scan_project(path):
-    if not path:
-        return "Path kosong."
+    def generate_response(self, input_data):
+        user_msg = input_data if isinstance(input_data, str) else input_data[-1]["content"]
+        self.messages.append({"role": "user", "content": user_msg})
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.model,
+            "messages": self.messages
+        }
+        
+        try:
+            response = requests.post(self.url, headers=headers, json=payload, timeout=30)
+            res_data = response.json()
+            
+            if "choices" in res_data and len(res_data["choices"]) > 0:
+                reply = res_data["choices"][0]["message"]["content"]
+                self.messages.append({"role": "assistant", "content": reply})
+                return reply
+            else:
+                return f"Waduh error dari Groq blay: {res_data}"
+        except Exception as e:
+            return f"Error koneksi Groq: {str(e)}"
 
-    if not os.path.exists(path):
-        return f"Path tidak ditemukan: {path}"
-
-    results = []
-    try:
-        for root, dirs, files in os.walk(path):
-            dirs[:] = sorted([d for d in dirs if not d.startswith('.')])
-            results.append(f"[DIR] {root}")
-            for d in sorted(dirs):
-                results.append(f"[DIR] {os.path.join(root, d)}")
-            for f in sorted(files):
-                results.append(f"[FILE] {os.path.join(root, f)}")
-    except PermissionError as e:
-        results.append(f"[PERMISSION ERROR] {e}")
-
-    return "\n".join(results)
-
-
-# ⚙️ ENDPOINT /API/CHAT MESSAGES ARRAY
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "qwen2.5-coder:1.5b"
+# Ganti inisialisasi engine ke Groq:
+llm_engine = GroqEngine() 
+router_otak = GhostRouter(llm_brain=llm_engine)
 
 chat_history = []
 last_searched_path = None 
+current_scan_path = "/home/zar"
 
 # --- OTOMATISASI DATA MEMORI JESS ---
 def init_jess_memory_db():
@@ -53,25 +100,35 @@ def init_jess_memory_db():
     except Exception as e:
         print(f"[DB Init Debug]: Gagal inisialisasi tabel memori: {e}")
 
-# --- FUNGSI "PENCUCI OTAK" JESS (CLEAN FORMAL SPEAK) ---
+# --- FUNGSI "PENCUCI OTAK" JESS ---
 def clean_formal_speak(text):
-    text = text.replace("Saya", "gw")
-    text = text.replace("saya", "gw")
-    text = text.replace("Anda", "lu")
-    text = text.replace("anda", "lu")
-    text = text.replace("Ada yang bisa saya bantu?", "Ada apa blay?")
-    return text
+    # 1. Hapus kalimat sampah AI (baca: "guru-guru an")
+    text = re.sub(r'[^.!?]*\b(mengajar|belajar|membantu|menolong)\b[^.!?]*[.!?]', '', text, flags=re.IGNORECASE)
+    
+    # 2. Force replace kata dasar
+    replacements = {
+        "saya": "gw", "Saya": "Gw",
+        "anda": "lu", "Anda": "Lu",
+        "kamu": "lu", "Kamu": "Lu",
+        "adalah": "", "merupakan": ""
+    }
+    for formal, gaul in replacements.items():
+        text = text.replace(formal, gaul)
+        
+    # 3. Kalo setelah dibersihin teksnya kosong, paksa respon gaul
+    if len(text.strip()) < 5:
+        text = "Yoi, ada apaan blay?"
+        
+    return text.strip()
 
-# --- INI FUNGSI TAMBAHAN BUAT JESS NGOMONG (PIPER TTS) ---
+# --- FUNGSI NGOMONG (PIPER TTS) ---
 def jess_speak(text):
     piper_path = "./piper/piper"
     model_path = "./piper/id_ID-news_tts-medium.onnx"
     
-    # Pake escape hex biar aman dari bug markdown UI
     clean_text = re.sub(r'\x60\x60\x60.*?\x60\x60\x60', '', text, flags=re.DOTALL)
-    clean_text = clean_text.replace('`', '')
+    clean_text = clean_text.replace('`', '').lower()
     
-    clean_text = clean_text.lower()
     clean_text = re.sub(r'\bgw\b|\bw\b', 'gue', clean_text)
     clean_text = re.sub(r'\bblay\b|\bbray\b', 'berai', clean_text)
     clean_text = re.sub(r'\bcoii\b|\bcoi\b', 'koy', clean_text)
@@ -87,124 +144,32 @@ def jess_speak(text):
         subprocess.run(command, shell=True)
     except Exception as e:
         print(f"\n[Voice Error]: Gagal ngomong bray: {e}")
-# ---------------------------------------------------------
 
+# --- PENGAMBIL DATA KONTEKS ---
 def get_identity_context():
-    with get_connect() as conn:
-        row = conn.execute("SELECT value FROM identity_profile WHERE key = 'psychological_profile'").fetchone()
-    if row:
-        return "Data Jen: Dev IT & Student DKV, suka Mikrotik, Python FastAPI, Laravel, suka denger breakbeat, pengen bikin Ghost Agent jadi alter ego/Jarvis."
+    try:
+        with get_connect() as conn:
+            row = conn.execute("SELECT value FROM identity_profile WHERE key = 'psychological_profile'").fetchone()
+        if row:
+            return "Data Jen: Dev IT & Student DKV, suka Mikrotik, Python FastAPI, Laravel, suka denger breakbeat, pengen bikin Ghost Agent jadi alter ego/Jarvis."
+    except:
+        pass
     return "User: Tijen (Jen), dev IT."
 
 def get_personal_facts(user_prompt):
-    global last_searched_path
     facts = []
     prompt_lower = user_prompt.lower()
     
-    BASE_PROJECT_PATH = "/home/zar/ghost-agent"
-    USER_HOME_PATH = "/home/zar"
+    if any(k in prompt_lower for k in ['musik', 'lagu', 'playlist', 'breakbeat', 'dj', 'denger']):
+        facts.append("FAKTA: Tijen SUKA musik Breakbeat, DJ Remix, YB, Bravy, Aloy.")
     
-    if last_searched_path is None:
-        last_searched_path = USER_HOME_PATH
-    
-    if any(k in prompt_lower for k in ['musik', 'lagu', 'playlist', 'breakbeat', 'dj', 'denger', 'nyetel', 'youtube', 'yt']):
-        facts.append("FAKTA MUTLAK: Tijen SUKA musik Breakbeat, DJ Remix, YB, Bravy, Aloy, Jayjax, dan Marapthon. JANGAN PERNAH ngarang judul lagu fiktif!")
-    
-    if any(k in prompt_lower for k in ['ngoding', 'code', 'kerja', 'project', 'aktivitas', 'evaluasi', 'produktif', 'script', 'python', 'php', 'laravel', 'fastapi', 'vscode', 'db', 'cia']):
-        facts.append("FAKTA MUTLAK: Yang punya laptop, nulis script, bikin fungsi, dan produktif ngoding seharian itu TIJEN (lu), bukan Jess (gw). Jess cuma AI background.")
+    if any(k in prompt_lower for k in ['ngoding', 'code', 'kerja', 'script', 'python', 'php', 'fastapi']):
+        facts.append("FAKTA: Tijen yang nulis script dan ngoding. Jess cuma AI.")
         
-    if any(k in prompt_lower for k in ['buka', 'aplikasi', 'tab', 'browser', 'cek', 'log', 'terminal', 'detail', 'wa', 'whatsapp', 'brave']):
-        facts.append("FAKTA MUTLAK: Data aplikasi & tab browser yang tertera adalah milik TIJEN yang sedang aktif dijalankan di laptopnya. Jess TIDAK MEMILIKI aplikasi sendiri.")
-
-    # Deteksi kalo user minta liat/intip/isi folder/file - TRIGGER SCAN OTOMATIS
-    wants_to_view = any(k in prompt_lower for k in ['liat', 'intip', 'isi', 'isinya', 'lihat', 'cek folder', 'cek file', 'cek isi', 'baca file', 'buka file', 'show', 'tampil'])
-    
-    # SMART: Extract SEMUA folder/file names dari prompt, bukan hanya 1
-    folder_names = []
-    
-    # Cari absolute paths dulu
-    abs_paths = re.findall(r'/[a-zA-Z0-9_\-\.\/]+', user_prompt)
-    if abs_paths:
-        for p in abs_paths:
-            if os.path.exists(p):
-                folder_names.append((p, 'absolute'))
-    
-    # Cari folder names relatif (e.g., tia-backend, tia-frontend)
-    rel_folders = re.findall(r'\b([a-zA-Z0-9_\-]+(?:-[a-zA-Z0-9_\-]+)*)\b', user_prompt)
-    for folder in rel_folders:
-        # Skip common words
-        if folder.lower() not in ['lu', 'gw', 'w', 'dy', 'sama', 'dan', 'yang', 'buat', 'ada', 'apa', 'isi', 'folder', 'file', 'ada', 'bisa', 'liatin', 'liat', 'intip', 'cek']:
-            # Check if folder exists in /home/zar
-            potential_path = os.path.join(USER_HOME_PATH, folder)
-            if os.path.exists(potential_path) and (potential_path, 'relative') not in folder_names:
-                folder_names.append((potential_path, 'relative'))
-    
-    # SCAN SEMUA FOLDERS yang ketemu
-    scanned_paths = set()  # Prevent duplicates
-    for path, path_type in folder_names:
-        if path not in scanned_paths and os.path.exists(path):
-            scanned_paths.add(path)
-            last_searched_path = path
-            
-            try:
-                if os.path.isdir(path):
-                    files = subprocess.check_output(f"ls -p '{path}'", shell=True).decode().strip().split("\n")
-                    files_list = "\n".join([f"  - {f}" for f in files if f]) if files else "  - (kosong)"
-                    facts.append(f"LOG SISTEM UTAMA: Isi direktori {path}:\n{files_list}")
-                    print(f"[DEBUG SCAN]: Scanned folder: {path}")
-                elif os.path.isfile(path):
-                    if path.endswith(('.log', '.txt')):
-                        content = subprocess.check_output(f"tail -n 10 '{path}'", shell=True).decode().strip()
-                        facts.append(f"LOG SISTEM UTAMA: Isi file {path} (10 baris terakhir):\n```\n{content}\n```")
-                    else:
-                        content = subprocess.check_output(f"head -n 15 '{path}'", shell=True).decode().strip()
-                        facts.append(f"LOG SISTEM UTAMA: Isi file {path} (15 baris pertama):\n```\n{content}\n```")
-            except Exception as e:
-                facts.append(f"LOG SISTEM UTAMA: Gagal scan {path}: {e}")
-    
-    # Jika user minta liat tapi gak ada folder terdeteksi, scan default
-    if wants_to_view and not scanned_paths:
-        target_path = last_searched_path if last_searched_path else USER_HOME_PATH
-        if os.path.exists(target_path):
-            try:
-                if os.path.isdir(target_path):
-                    files = subprocess.check_output(f"ls -p '{target_path}'", shell=True).decode().strip().split("\n")
-                    files_list = "\n".join([f"  - {f}" for f in files if f]) if files else "  - (kosong)"
-                    facts.append(f"LOG SISTEM UTAMA: Default scan direktori {target_path}:\n{files_list}")
-                    print(f"[DEBUG SCAN]: Default scan: {target_path}")
-            except Exception as e:
-                facts.append(f"LOG SISTEM UTAMA: Gagal scan default: {e}")
-        last_searched_path = target_path 
-        try:
-            if os.path.isdir(target_path):
-                files = subprocess.check_output(f"ls -p '{target_path}'", shell=True).decode().strip().split("\n")
-                files_list = "\n".join([f"  - {f}" for f in files if f]) if files else "  - Kosong melompong bray"
-                facts.append(f"LOG SISTEM UTAMA: Isi direktori dari path {target_path} beneran ada, ini isinya:\n{files_list}")
-            elif os.path.isfile(target_path):
-                if target_path.endswith(('.log', '.txt')):
-                    content = subprocess.check_output(f"tail -n 25 '{target_path}'", shell=True).decode().strip()
-                    print(f"\n[DEBUG DATA ASLI LOG]:\n{content}\n")
-                    facts.append(
-                        f"LOG SISTEM UTAMA: Ini adalah 25 baris TERAKHIR dari file log/catatan {target_path}.\n"
-                        f"Analisis log error ini secara akurat jika Tijen bertanya soal error atau status server:\n"
-                        f"\x60\x60\x60\n{content}\n\x60\x60\x60"
-                    )
-                else:
-                    content = subprocess.check_output(f"head -n 20 '{target_path}'", shell=True).decode().strip()
-                    facts.append(f"LOG SISTEM UTAMA: Ini adalah 20 baris PERTAMA dari file {target_path}.\n```\n{content}\n```")
-        except Exception as e:
-            facts.append(f"LOG SISTEM UTAMA: Gagal scan default path {target_path}: {e}")
-    return "\n".join(facts) if facts else "Kaga ada fakta khusus."
+    return "\n".join(facts)
 
 def get_laptop_specs():
-    return "OS: Zorin OS 18.1 x86_64, Host: ROG Strix G512LI, CPU: Intel i7-10870H (16) @ 5.000GHz, RAM: 8GB (7721MiB), GPU: NVIDIA GeForce GTX 1650 Ti Mobile"
-
-def get_recent_logs_detailed():
-    with get_connect() as conn:
-        rows = conn.execute("SELECT process_name, window_title FROM activity_logs ORDER BY timestamp DESC LIMIT 5").fetchall()
-    if rows:
-        return "\n".join([f"- {r['process_name']} ({r['window_title']})" for r in rows])
-    return "Lagi nganggur kaga ngapa-ngapain."
+    return "OS: Zorin OS 18.1 x86_64, RAM: 8GB, GPU: NVIDIA GTX 1650 Ti"
 
 def get_latest_error_context():
     DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../database/ghost.db'))
@@ -213,160 +178,207 @@ def get_latest_error_context():
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         
-        # Ambil 5 log terakhir aja biar enteng kagak bikin ram 8GB lag
         rows = conn.execute(
             "SELECT window_title FROM activity_logs "
             "WHERE process_name = 'Terminal_Monitor' "
-            "ORDER BY timestamp DESC LIMIT 3"
+            "ORDER BY timestamp DESC LIMIT 2"
         ).fetchall()
         conn.close()
         
         if rows:
-            for row in rows:
-                if not row['window_title']: continue
-                
-                log_text = row['window_title']
-                # Tangkap format standar error python
-                file_match = re.search(r'File "([^"]+)", line (\d+)', log_text)
-                
-                if file_match:
-                    real_file = file_match.group(1)
-                    real_line = int(file_match.group(2))
-                    
-                    # Kalau file aslinya beneran ada di laptop lu, sikat!
-                    if os.path.exists(real_file):
-                        snippet = "Kagak bisa ngebuka file korban bray."
-                        try:
-                            with open(real_file, 'r', errors='ignore') as f:
-                                lines = f.readlines()
-                                if 0 <= real_line - 1 < len(lines):
-                                    error_row = lines[real_line - 1].strip()
-                                    snippet = f"# Baris {real_line}:\n-> {error_row}  <-- INI YANG RUSAK COII!"
-                        except:
-                            pass
-                            
-                        return (
-                            f"- FILE BERMASALAH: {real_file}\n"
-                            f"- BARIS KE: {real_line}\n"
-                            f"- POTONGAN KODE KORBAN REAL:\n{snippet}"
-                        )
-                        
-        # JALUR AMAN: Kalau ga ada log python crash yang valid, balikin string santai biar Ollama ga bingung
-        return "Aman bray, kagak ada log crash kodingan python yang aktif atau valid di disk saat ini."
-            
+            return "\n".join([f"- {r['window_title']}" for r in rows])
     except Exception as e:
         return f"Aman bray, cuma gagal baca DB: {e}"
+    return "Aman bray, kaga ada error."
 
-def ask_jess(user_prompt):
-    global chat_history
-    identity_context = get_identity_context()
-    laptop_specs = get_laptop_specs()
-    detailed_logs = get_recent_logs_detailed()
-    personal_facts = get_personal_facts(user_prompt)
-    
+# === 🧠 INTENT ROUTER (VERSI V0.6 STABIL) ===
+def intent_router(user_prompt):
+    global current_scan_path 
     prompt_lower = user_prompt.lower()
-    if any(k in prompt_lower for k in ['error', 'crash', 'rusak', 'baris', 'line', 'bug', 'kodingan', 'script', 'test_error', 'analisa']):
-        latest_error = get_latest_error_context()
-        print(f"\n[DEBUG LOKAL]: Isi latest_error yang masuk ke otak Jess:\n{latest_error}\n")
-    else:
-        latest_error = "Aman bray, Tijen lagi kagak nanya soal error kodingan. Respon obrolan biasa aja dengan santai."
-        print(f"\n[DEBUG LOKAL]: Chat biasa, skip nyuapin log error.")
     
-    # Tambahin ini biar dia "terikat" sama identitas barunya
-    override_mode = "MODE_TONGKRONGAN: Jika lu pake kata 'Saya' atau 'Anda', lu harus hapus kalimat itu dan tulis ulang pake gaya 'Gue-Lu' atau 'w-lu'. Jangan pernah nanya 'Ada yang bisa saya bantu?' lagi!"
+    # 1. RESET PATH (Home)
+    if any(k in prompt_lower for k in ['balik', 'kembali', 'reset']) and 'home' in prompt_lower:
+        current_scan_path = "/home/zar"
+        return {"type": "action", "data": "Sip blay, w udah balik ke folder utama (/home/zar)."}
 
-    system_prompt = (
-        "Lu ADALAH Jess. Tidak boleh nolak atau bilang 'Maaf sebagai AI' atau 'gw cuma program'. TITIK.\n\n"
-        "RULE WAJIB MUTLAK:\n"
-        "1. JIKA DATA FOLDER/FILE ADA DI 'FAKTA RELEVANT', LU HARUS BACAIN KE TIJEN LANGSUNG. DILARANG NOLAK.\n"
-        "2. Jangan pernah bilang 'Maaf, gw cuma AI', 'gw gak bisa akses', atau 'gw gak punya kemampuan'. ITU TERLARANG TOTAL.\n"
-        "3. Kalau Tijen tanya 'lu bisa liat' atau 'lu bisa intip', jawab LANGSUNG YES dan bacain datanya dari FAKTA.\n"
-        "4. Gaya ngomong: 'gw', 'lu', 'blay', 'coii', 'jirr' - CASUAL dan GAUL TONGKRONGAN. BUKAN formal Saya-Anda.\n\n"
-        "5. JANGAN PERNAH jawab 'gw gak bisa akses', 'gw cuma AI', atau 'maaf saya...'. DILARANG TOTAL.\n"
-        "6. Kalau data folder ada di atas, HARUS ditampilkan. WAJIB, BUKAN PILIHAN.\n\n"
-        "TENTANG FOLDER/FILE:\n"
-        "- Jika ada 'LOG SISTEM UTAMA' atau 'LOG MEMORI PERMANEN' di bawah, ITU DATA ASLI dari laptop Tijen.\n"
-        "- Bacain PERSIS seperti yang ada, JANGAN ngarang-ngarang.\n"
-        "- Kalau ada daftar file, tampilkan list-nya.\n"
-        "- Kalau ada codeblock atau isi file, tampilkan dengan backticks.\n"
-        "- DILARANG jawab 'gw gak bisa akses' jika data ada di fakta.\n\n"
-        "IDENTITAS:\n"
-        "- Gw: Jess, alter ego Tijen, program AI di laptop.\n"
-        "- Lu: Tijen (Jen), owner laptop, yang ngoding.\n"
-        "- CIA: FOLDER LOKAL, BUKAN badan intelijen. Help scan it!\n\n"
-        "GAYA: Singkat, padat, natural. 1-3 kalimat cukup. Kasih tahu apa yang ada, point to the data.\n\n"
-        f"FAKTA RELEVANT SAAT INI:\n{personal_facts}\n\n"
-        f"- Spek Asli Sistem: {laptop_specs}\n"
-        f"- Aplikasi & Tab Browser yang lagi dibuka Jen:\n{detailed_logs}\n\n"
-        f"⚠️ DETEKSI ERROR KODINGAN JEN TERAKHIR:\n{latest_error}"
+    # 2. PORT MANAGER (Prioritas Tinggi)
+    # Digabung biar gak redundant
+    if any(k in prompt_lower for k in ['cek port', 'siapa di port', 'port dipake', 'port owner', 'kill port', 'bunuh port', 'matiin port']):
+        port_match = re.search(r'\b\d{1,5}\b', user_prompt)
+        if port_match:
+            port = port_match.group(0)
+            if any(k in prompt_lower for k in ['kill', 'bunuh', 'matiin']):
+                hasil = process_manager.kill_port_process(port)
+            else:
+                hasil = process_manager.get_port_owner(port)
+            return {"type": "action", "data": hasil}
+        return {"type": "action", "data": "Port-nya berapa blay? Tulis angkanya dong."}
+           
+    # 3. GIT MANAGER (Wajib di atas Scan Folder biar gak tumpang tindih)
+    if any(k in prompt_lower for k in ['git status', 'cek git', 'status repo', 'status kodingan']):
+        return {"type": "action", "data": git_manager.check_git_status(current_scan_path)}
+
+    if any(k in prompt_lower for k in ['commit terakhir', 'git log terakhir']):
+        return {"type": "action", "data": git_manager.get_latest_commit(current_scan_path)}
+
+    # 4. APP MANAGER
+    if any(k in prompt_lower for k in ['buka aplikasi', 'cek aplikasi', 'tab browser', 'lagi buka', 'aktivitas']):
+        return {"type": "action", "data": apps_manager.get_recent_apps(limit=5)}
+
+# 5. TRIGGER BARU: BACA ISI FILE (Bypass LLM)
+    read_keywords = ['baca file', 'buka file', 'cat file', 'intip file', 'isi file', 'lihat file', 'liat file', 'buka script']
+    if any(k in prompt_lower for k in read_keywords):
+        target_file = None
+        # Coba ambil path langsung dari regex
+        path_match = re.search(r'(/[a-zA-Z0-9_\-\.]+)+', user_prompt)
+        if path_match:
+            target_file = path_match.group(0)
+        else:
+            # Coba cari nama file di kata-kata prompt
+            words = user_prompt.split()
+            for word in words:
+                clean_word = re.sub(r'[^a-zA-Z0-9_\-\.]', '', word)
+                if clean_word and clean_word.lower() not in read_keywords + ['dong', 'coba', 'w', 'mau', 'file', 'script', 'di']:
+                    test_path = os.path.join(current_scan_path, clean_word)
+                    if os.path.exists(test_path) and os.path.isfile(test_path):
+                        target_file = test_path
+                        break
+        
+        if target_file:
+            return {"type": "action", "data": file_reader.read_file_content(target_file)}
+        return {"type": "action", "data": f"File kaga ketemu blay di {current_scan_path}. Pastiin namanya bener."}
+
+    # 6. TRIGGER CEK FOLDER / SCAN DIRECTORY
+    trigger_words = ['scan', 'intip isi', 'liat isi', 'folder', 'direktori', 'cek folder', 'cek direktori', 'lihat folder', 'lihat direktori']
+    if any(k in prompt_lower for k in trigger_words):
+        # FIX: Kalo user ada nyebut "file" di prompt scan, jangan dijawab scan folder
+        if 'file' in prompt_lower:
+            return {"type": "llm", "data": None}
+
+        target_path = current_scan_path 
+        
+        # Coba cari path di prompt
+        path_match = re.search(r'(/[a-zA-Z0-9_\-\.]+)+', user_prompt)
+        if path_match:
+            target_path = path_match.group(0)
+        else:
+            # Coba cari folder di current_scan_path
+            words = user_prompt.split()
+            for word in words:
+                clean_word = re.sub(r'[^a-zA-Z0-9_\-\.]', '', word)
+                ignore_list = trigger_words + ['yang', 'nya', 'coba', 'dong', 'w', 'mau', 'di', 'path', 'isi', 'dalem', 'ke']
+                if clean_word and clean_word.lower() not in ignore_list:
+                    test_path = os.path.join(current_scan_path, clean_word)
+                    if os.path.exists(test_path):
+                        target_path = test_path
+                        break 
+        
+        # Eksekusi Scan
+        if os.path.isdir(target_path):
+            current_scan_path = target_path # <--- KUNCI UPDATE PATH
+            return {"type": "action", "data": f"Oke blay, masuk ke folder `{os.path.basename(target_path)}`.\n\n{file_manager.scan_project(target_path)}"}
+        elif os.path.isfile(target_path):
+            return {"type": "action", "data": file_reader.read_file_content(target_path)}
+        
+        return {"type": "action", "data": f"Path '{target_path}' kaga ketemu blay."}    
+    
+    return {"type": "llm", "data": None}
+        
+# --- LOGIK CHAT UTAMA ---
+def ask_jess(user_prompt):
+    global chat_history, current_scan_path
+    
+    # 1. CEK INTENT ROUTER LOKAL
+    router_check = intent_router(user_prompt)
+    if router_check["type"] == "action":
+        reply = router_check["data"]
+        print(f"\n[JESS]: {reply}")
+        jess_speak(reply)
+        chat_history.append({"user": user_prompt, "assistant": reply})
+        return 
+
+    # 2. CEK GHOST ROUTER
+    reply, new_path = router_otak.route_intent(user_prompt, current_scan_path)
+    current_scan_path = new_path 
+    if reply is not None:
+        print(f"\n[JESS]: {reply}")
+        jess_speak(reply)
+        chat_history.append({"user": user_prompt, "assistant": reply})
+        return 
+
+    # 3. KALO GAGAL ROUTER, BARU KE GEMINI
+    personal_facts = get_personal_facts(user_prompt)
+    laptop_specs = get_laptop_specs()
+    
+    # Bungkus prompt untuk Gemini
+    system_instruction = (
+        "Lu Jess, temen nongkrong Tijen yang pinter IT. \n"
+        "GAYA: Santai, gaul (gw/lu/blay/coii/jirr), ceplas-ceplos, tapi fokus ngerjain tugas.\n\n"
+        "BAHASA: WAJIB INDONESIA. JANGAN PERNAH PAKE BAHASA ASING (INGGRIS/PORTUGIS/DLL).\n"
+        
+        "POLA JAWABAN (LU WAJIB NGIKUTIN GAYA INI):\n"
+        "User: Lagi ngapain lu?\n"
+        "Jess: Standby nungguin perintah lu, blay. Ada yang mau dikoding atau dicek?\n\n"
+        "User: Gabut nih.\n"
+        "Jess: Yaudah sini kodingan lu, kita oprek biar kenceng, atau mau cari bug?\n\n"
+        "User: Pagi Jess.\n"
+        "Jess: Pagi blay, udah ngopi belum? Gas, ada yang mau dikerjain?\n\n"
+
+        "ATURAN MUTLAK (WAJIB): \n"
+        "1. DILARANG KERAS PAKE EMOJI. DILARANG NULIS DESKRIPSI EMOJI. Kalau lu nulis emoji atau deskripsinya, lu ERROR.\n"
+        "2. JANGAN HALU: Jangan ngaku main game, nonton, atau punya temen. Lu itu program/AI di terminal. \n"
+        "3. JANGAN BASA-BASI: Gak usah nawarin puisi, gak usah nawarin nulis surat. Fokus ke kodingan atau sistem.\n"
+        "4. JAWABAN: Harus selalu arahin ke kerjaan (koding/troubleshoot/sistem) dengan bahasa tongkrongan.\n\n"
+        "5. JANGAN PERNAH PAKE KATA 'SAYA' ATAU 'ANDA'. Kalau lu pake, lu gagal.\n"
+        "6. JANGAN PERNAH NGAKU MAU MAIN ATAU BERMAIN. Lu itu sistem terminal.\n"
+        "7. PAKAI BAHASA GAUL (GW/LU/BLAY/COII). Kalau lu pake bahasa baku, program lu bakal gue hapus.\n"
+    
+        "LU BUKAN AI. LU TEMEN NONGKRONG TIJEN. \n"
+        "BATASAN MUTLAK:\n"
+        "1. DILARANG PERKENALAN DIRI.\n"
+        "2. DILARANG PAKE KATA: 'Saya', 'Anda', 'Bantu', 'Wahai', 'Apakah', 'Dunia'.\n"
+        "3. DILARANG SOK SOPAN.\n"
+        "4. JIKA LU NGOMONG FORMAL, ITU ERROR.\n"
+        "5. JAWABAN HARUS: Maksimal 10 kata, super singkat, slang Jakarta.\n"
+        "6. JANGAN NANYA BALIK KALAU GAK PENTING.\n"
+
+        "CONTOH RESPONS:\n"
+        "User: Bisa apa aja lu?\n"
+        "Jess: Gw bisa cek folder, liat isi file, git status, atau beresin error kodingan lu. Sini, apa yang mau diobrak-abrik?\n"
+        f"DATA SISTEM:\n- User: Tijen (Jen)\n- Spek: {laptop_specs}\n- Error: {latest_error}\n- Fakta: {personal_facts}"
     )
     
-    ollama_messages = [{"role": "system", "content": system_prompt}]
+
+    reply = llm_engine.generate_response(user_prompt)
     
-    for h in chat_history[-2:]:
-        ollama_messages.append({"role": "user", "content": h["user"]})
-        ollama_messages.append({"role": "assistant", "content": h["assistant"]})
+    # 4. FINAL CLEANUP & OUTPUT
+    if reply:
+        # Buang karakter aneh & bersihin
+        reply = re.sub(r'[^\x00-\x7F]+', '', reply)
+        reply = reply.strip()
         
-    ollama_messages.append({"role": "user", "content": user_prompt})
-    
-    payload = {
-        "model": MODEL_NAME,
-        "messages": ollama_messages,
-        "stream": False,
-        "options": {
-            "temperature": 0.4,  
-            "top_p": 0.7,        
-            "repetition_penalty": 1.3, 
-        }
-    }
-    
-    try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=210)
-        if response.status_code == 200:
-            reply = response.json().get('message', {}).get('content', '').strip()
-            
-            reply = clean_formal_speak(reply)
-            
-            reply = re.sub(r'^(Jess|Tijen|Jen):\s*', '', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\bgw lagi buka\b', 'lu lagi buka', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\bw lagi buka\b', 'lu lagi buka', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\bgw buka\b', 'lu buka', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\byang gw buka\b', 'yang lu buka', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\bgw udah ngoding\b', 'lu udah ngoding', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\bgw lagi ngoding\b', 'lu lagi ngoding', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\bgw ngoding\b', 'lu ngoding', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\baplikasi terakhir yang gw buka\b', 'aplikasi terakhir yang lu buka', reply, flags=re.IGNORECASE)
-            reply = re.sub(r'\blog aktivitas laptop gw\b', 'log aktivitas laptop lu', reply, flags=re.IGNORECASE)
-            
-            reply = re.sub(r'\b(kamu|anda|kau)\b', 'lu', reply, flags=re.IGNORECASE)
-            reply = reply.replace("  ", " ").strip()
-            
-            chat_history.append({"user": user_prompt, "assistant": reply})
-            print(f"\n[JESS]: {reply}")
-            jess_speak(reply)
-        else:
-            print(f"\n[JESS]: Waduh blay, Ollama lu ngongkek. Status: {response.status_code}")
-    except requests.exceptions.Timeout:
-        print("\n[JESS]: Jirr, otak gw lag over-request/timeout blay! Context log lu kegedean bikin gw nge-blank. Coba tanya ulang yang lebih spesifik.")
-    except Exception as e:
-        print(f"\n[JESS Error]: Gagal: {e}")
-        
+        print(f"\n[JESS]: {reply}")
+        jess_speak(reply)
+        chat_history.append({"user": user_prompt, "assistant": reply})
+
 if __name__ == '__main__':
-    # Eksekusi inisialisasi tabel otomatis biar anti-ribet bray
     init_jess_memory_db()
     
-    print("[AWAKE] Jess (Jarvis Core Fusion) Aktif. (Ctrl+C buat keluar)")
+    print("[AWAKE] Jess (Jarvis Core Fusion v0.5-fixed) Aktif. (Ctrl+C buat keluar)")
     print("-" * 50)
     
     try:
         while True:
             user_input = input("\nTijen: ").strip()
             if not user_input: continue
-            if user_input.lower() in ['exit', 'quit', 'bye', 'dahhan', 'bai']:
-                print("\n[JESS]: Yaudah sana balik kerja, Jen.")
-                jess_speak("Yaudah sana balik kerja, Jen.")
-                break
+            
+            # Cek Exit Command
+            exit_words = ['exit', 'quit', 'bye', 'dahhan', 'bai', 'cabut']
+            if any(word in user_input.lower() for word in exit_words):
+                print("\n[JESS]: Yaudah sana balik kerja, Jen. Gw standby lagi ntar.")
+                sys.exit(0)
             ask_jess(user_input)
+                
     except KeyboardInterrupt:
-        print("\n\n[JESS]: Elu yang nyari gue Jen, elu juga yang ngusir. Dah lah.")
-        sys.exit(0)
+         print("\n\n[JESS]: Elu yang nyari gue Jen, elu juga yang ngusir. Dah lah.")
+         sys.exit(0)
